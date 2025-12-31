@@ -18,3 +18,11 @@ config SPI_ESP32_INTERRUPT
 	  Enables interrupt support for ESP32 SPI driver.
 
 endif # ESP32_SPIM
+
+# TODO: figure out proper formatting; nrfx has umbrella spi menuconfig
+menuconfig ESP32_SPIS
+	bool "ESP32 SPI Slave driver"
+	default y
+	depends on DT_HAS_ESPRESSIF_ESP32_SPI_ENABLED
+	help
+	  Enables support for ESP32 SPI Slave driver.
