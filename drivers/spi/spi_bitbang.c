@@ -14,19 +14,24 @@ LOG_MODULE_REGISTER(spi_bitbang);
 #include <zephyr/drivers/spi.h>
 #include <zephyr/drivers/spi/rtio.h>
 #include "spi_context.h"
+#include "spi_bitbang_common.h"
 
-struct spi_bitbang_data {
-	struct spi_context ctx;
-	int bits;
-	int wait_us;
-	int dfs;
-};
+static void clock_delay(struct spi_bitbang_data *data, const struct spi_bitbang_config *info) 
+{
+	k_busy_wait(data->wait_us);
+}
 
-struct spi_bitbang_config {
-	struct gpio_dt_spec clk_gpio;
-	struct gpio_dt_spec mosi_gpio;
-	struct gpio_dt_spec miso_gpio;
-};
+static void clock_assert_and_wait(struct spi_bitbang_data *data,
+				  const struct spi_bitbang_config *info)
+{
+	gpio_pin_set_dt(&info->clk_gpio, !data->xfer.clock_state);
+	clock_delay(data, info);
+}
+
+static void clock_deassert(struct spi_bitbang_data *data, const struct spi_bitbang_config *info)
+{
+	gpio_pin_set_dt(&info->clk_gpio, data->xfer.clock_state);
+}
 
 static int spi_bitbang_configure(const struct spi_bitbang_config *info,
 			    struct spi_bitbang_data *data,
@@ -42,20 +47,7 @@ static int spi_bitbang_configure(const struct spi_bitbang_config *info,
 		return -ENOTSUP;
 	}
 
-	const int bits = SPI_WORD_SIZE_GET(config->operation);
-
-	if (bits > 32) {
-		LOG_ERR("Word sizes > 32 bits not supported");
-		return -ENOTSUP;
-	}
-
-	data->bits = bits;
-	data->dfs = ((data->bits - 1) / 8) + 1;
-
-	/* As there is no uint24_t, it is assumed uint32_t will be used as the buffer base type. */
-	if (data->dfs == 3) {
-		data->dfs = 4;
-	}
+	spi_bitbang_compute_dfs(config, data);
 
 	if (config->frequency > 0) {
 		/* convert freq to period, the extra /2 is due to waiting
@@ -80,15 +72,17 @@ static int spi_bitbang_transceive(const struct device *dev,
 	const struct spi_bitbang_config *info = dev->config;
 	struct spi_bitbang_data *data = dev->data;
 	struct spi_context *ctx = &data->ctx;
+	struct spi_bitbang_xfer *xfer = &data->xfer;
 	int rc;
-	const struct gpio_dt_spec *miso = NULL;
-	const struct gpio_dt_spec *mosi = NULL;
 	gpio_flags_t mosi_flags = GPIO_OUTPUT_INACTIVE;
 
 	rc = spi_bitbang_configure(info, data, spi_cfg);
 	if (rc < 0) {
 		return rc;
 	}
+
+	xfer->data_in = NULL;
+	xfer->data_out = NULL;
 
 	if (spi_cfg->operation & SPI_HALF_DUPLEX) {
 		if (!info->mosi_gpio.port) {
@@ -101,19 +95,19 @@ static int spi_bitbang_transceive(const struct device *dev,
 			return -EINVAL;
 		} else if (tx_bufs && !rx_bufs) {
 			/* TX mode */
-			mosi = &info->mosi_gpio;
+			xfer->data_out = &info->mosi_gpio;
 		} else if (!tx_bufs && rx_bufs) {
 			/* RX mode */
 			mosi_flags = GPIO_INPUT;
-			miso = &info->mosi_gpio;
+			xfer->data_in = &info->mosi_gpio;
 		}
 	} else {
 		if (info->mosi_gpio.port) {
-			mosi = &info->mosi_gpio;
+			xfer->data_out = &info->mosi_gpio;
 		}
 
 		if (info->miso_gpio.port) {
-			miso = &info->miso_gpio;
+			xfer->data_in = &info->miso_gpio;
 		}
 	}
 
@@ -125,119 +119,14 @@ static int spi_bitbang_transceive(const struct device *dev,
 		}
 	}
 
+	spi_bitbang_xfer_setup(spi_cfg, data);
 	spi_context_buffers_setup(ctx, tx_bufs, rx_bufs, data->dfs);
 
-	int clock_state = 0;
-	int cpha = 0;
-	bool loop = false;
-	bool lsb = false;
-
-	if (SPI_MODE_GET(spi_cfg->operation) & SPI_MODE_CPOL) {
-		clock_state = 1;
-	}
-	if (SPI_MODE_GET(spi_cfg->operation) & SPI_MODE_CPHA) {
-		cpha = 1;
-	}
-	if (SPI_MODE_GET(spi_cfg->operation) & SPI_MODE_LOOP) {
-		loop = true;
-	}
-	if (spi_cfg->operation & SPI_TRANSFER_LSB) {
-		lsb = true;
-	}
-
 	/* set the initial clock state before CS */
-	gpio_pin_set_dt(&info->clk_gpio, clock_state);
+	gpio_pin_set_dt(&info->clk_gpio, xfer->clock_state);
 
 	spi_context_cs_control(ctx, true);
-
-	const uint32_t wait_us = data->wait_us;
-
-	while (spi_context_tx_buf_on(ctx) || spi_context_rx_buf_on(ctx)) {
-		uint32_t w = 0;
-
-		if (ctx->tx_len) {
-			switch (data->dfs) {
-			case 4:
-			case 3:
-				w = *(uint32_t *)(ctx->tx_buf);
-				break;
-			case 2:
-				w = *(uint16_t *)(ctx->tx_buf);
-				break;
-			case 1:
-				w = *(uint8_t *)(ctx->tx_buf);
-				break;
-			}
-		}
-
-		uint32_t r = 0;
-		uint8_t i = 0;
-		int b = 0;
-		bool do_read = false;
-
-		if (miso && spi_context_rx_buf_on(ctx)) {
-			do_read = true;
-		}
-
-		while (i < data->bits) {
-			const int shift = lsb ? i : (data->bits - 1 - i);
-			const int d = (w >> shift) & 0x1;
-
-			b = 0;
-
-			/* setup data out first thing */
-			if (mosi) {
-				gpio_pin_set_dt(mosi, d);
-			}
-
-			k_busy_wait(wait_us);
-
-			if (!loop && do_read && !cpha) {
-				b = gpio_pin_get_dt(miso);
-			}
-
-			/* first (leading) clock edge */
-			gpio_pin_set_dt(&info->clk_gpio, !clock_state);
-
-			k_busy_wait(wait_us);
-
-			if (!loop && do_read && cpha) {
-				b = gpio_pin_get_dt(miso);
-			}
-
-			/* second (trailing) clock edge */
-			gpio_pin_set_dt(&info->clk_gpio, clock_state);
-
-			if (loop) {
-				b = d;
-			}
-
-			r |= (b ? 0x1 : 0x0) << shift;
-
-			++i;
-		}
-
-		if (spi_context_rx_buf_on(ctx)) {
-			switch (data->dfs) {
-			case 4:
-			case 3:
-				*(uint32_t *)(ctx->rx_buf) = r;
-				break;
-			case 2:
-				*(uint16_t *)(ctx->rx_buf) = r;
-				break;
-			case 1:
-				*(uint8_t *)(ctx->rx_buf) = r;
-				break;
-			}
-		}
-
-		LOG_DBG(" w: %04x, r: %04x , do_read: %d", w, r, do_read);
-
-		spi_context_update_tx(ctx, data->dfs, 1);
-		spi_context_update_rx(ctx, data->dfs, 1);
-	}
-
+	spi_bitbang_transfer(info, data);
 	spi_context_cs_control(ctx, false);
 
 	spi_context_complete(ctx, dev, 0);
@@ -330,11 +219,18 @@ int spi_bitbang_init(const struct device *dev)
 	return 0;
 }
 
+static const struct spi_bitbang_ops master_bitbang_ops = {
+    .pre_clock    = clock_delay,
+    .clock_active = clock_assert_and_wait,
+    .post_clock   = clock_deassert
+};
+
 #define SPI_BITBANG_INIT(inst)						\
 	static struct spi_bitbang_config spi_bitbang_config_##inst = {	\
 		.clk_gpio = GPIO_DT_SPEC_INST_GET(inst, clk_gpios),	\
 		.mosi_gpio = GPIO_DT_SPEC_INST_GET_OR(inst, mosi_gpios, {0}),	\
 		.miso_gpio = GPIO_DT_SPEC_INST_GET_OR(inst, miso_gpios, {0}),	\
+		.bitbang_ops = &master_bitbang_ops,\
 	};								\
 									\
 	static struct spi_bitbang_data spi_bitbang_data_##inst = {	\
